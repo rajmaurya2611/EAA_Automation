@@ -203,7 +203,6 @@ def extract_row(item: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": item.get("id"),
         "title": item.get("title"),
-        # NOTE: removed "type" from extraction to avoid leaking to outputs
         "subtype": item.get("subtype"),
         "company_id": org.get("id") or item.get("organization_id"),
         "company": org.get("name"),
@@ -239,8 +238,7 @@ COLUMN_MAP = {
     "title": "job_title",
     "company": "company_name",
     "company_id": "company_id",
-    # "type": "type",  # removed from contract
-    "subtype": "oppurtunity_type",  # renamed (as requested spelling)
+    "subtype": "oppurtunity_type",  # requested spelling
     "work_mode": "work_mode",
     "salary": "salary_range",
     "timing": "timing",
@@ -267,8 +265,8 @@ OUTPUT_COLUMNS = [
     "job_title",
     "company_name",
     "company_id",
-    "platform",  # added
-    "oppurtunity_type",  # renamed
+    "platform",
+    "oppurtunity_type",
     "status",
     "work_mode",
     "salary_range",
@@ -325,24 +323,40 @@ def _coerce_job_id(row: Dict[str, Any]) -> Optional[int]:
         return None
 
 
+def _build_composite_key(row: Dict[str, Any]) -> Optional[str]:
+    """
+    platform:oppurtunity_type:job_id
+    """
+    platform = str(row.get("platform") or "").strip().lower()
+    opp_type = str(row.get("oppurtunity_type") or "").strip().lower()
+
+    if not platform or not opp_type:
+        return None
+
+    jid = _coerce_job_id(row)
+    if jid is None:
+        return None
+
+    return f"{platform}:{opp_type}:{jid}"
+
+
 def scrape_jobs(
     cfg: ScrapeConfig,
     *,
-    existing_job_ids: Optional[Set[int]] = None,
+    existing_job_ids: Optional[Set[str]] = None,
     stop_when_page_all_seen: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Returns:
       (delta_rows, stats)
 
-    Dedupe happens HERE (platform level):
-      - If existing_job_ids is provided, we only return rows whose job_id NOT in that set.
+    Dedupe happens HERE using composite key:
+      platform + oppurtunity_type + job_id
 
     stop_when_page_all_seen:
-      - If True, and a page returns 100% already-seen job_ids, we early-stop.
-      - This makes runs cheaper as Firebase grows.
+      - If True, and a page returns 100% already-seen composite keys, we early-stop.
     """
-    existing_job_ids = existing_job_ids or set()
+    existing_keys = existing_job_ids or set()
 
     session, timeout_s = make_session()
     delta_rows: List[Dict[str, Any]] = []
@@ -354,6 +368,7 @@ def scrape_jobs(
         "kept_delta": 0,
         "skipped_existing": 0,
         "skipped_missing_job_id": 0,
+        "skipped_missing_composite": 0,
         "early_stop_all_seen_page": 0,
     }
 
@@ -378,17 +393,25 @@ def scrape_jobs(
             mapped = remap_row(extracted)
             stats["items_seen"] += 1
 
+            # Validate job_id
             jid = _coerce_job_id(mapped)
             if jid is None:
                 stats["skipped_missing_job_id"] += 1
                 page_all_seen = False
                 continue
 
-            if jid in existing_job_ids:
+            # Composite key
+            key = _build_composite_key(mapped)
+            if key is None:
+                stats["skipped_missing_composite"] += 1
+                page_all_seen = False
+                continue
+
+            if key in existing_keys:
                 stats["skipped_existing"] += 1
                 continue
 
-            # new job for main data
+            # new row
             page_all_seen = False
             delta_rows.append(mapped)
             stats["kept_delta"] += 1
@@ -406,7 +429,7 @@ def unstop(
     per_page: int = 18,
     max_pages: int = 0,
     *,
-    existing_job_ids: Optional[Set[int]] = None,
+    existing_job_ids: Optional[Set[str]] = None,
     stop_when_page_all_seen: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     cfg = ScrapeConfig(per_page=int(per_page), max_pages=int(max_pages), extra_params=None)

@@ -6,7 +6,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from app.job_platforms.unstop import OUTPUT_COLUMNS, unstop as unstop_platform
 from app.ops.job_rtdb import (
@@ -17,8 +17,9 @@ from app.ops.job_rtdb import (
 # -------------------------------------------------------------------
 # Output directories
 # -------------------------------------------------------------------
-OUTPUT_DIR_EXTRACT = Path("output") / "extract data"
-OUTPUT_DIR_LATEST = Path("output") / "extracted_latest_jobs"
+# Base: output/extract data/jobs/<platform>/
+OUTPUT_DIR_EXTRACT_BASE = Path("output") / "extract data" / "jobs"
+OUTPUT_DIR_LATEST = Path("output") / "extracted_latest" /"jobs"
 
 # -------------------------------------------------------------------
 # Defaults / governance knobs
@@ -29,12 +30,30 @@ DEFAULT_PER_PAGE = 18
 # keep safe default because Unstop often breaks after page 1/2
 DEFAULT_MAX_PAGES = 1
 
-DEFAULT_OUT_PREFIX = "unstop_jobs"
 FIREBASE_NODE_PATH = os.getenv("FIREBASE_JOBS_NODE_PATH", "ai/jobs")
 
 
 def _timestamp_str() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _delete_all_files_in_dir(dir_path: Path) -> int:
+    """
+    Deletes all files in directory (not folders). Returns count deleted.
+    """
+    if not dir_path.exists():
+        return 0
+
+    deleted = 0
+    for p in dir_path.iterdir():
+        if p.is_file():
+            try:
+                p.unlink()
+                deleted += 1
+            except Exception:
+                # best-effort: don't fail pipeline for one locked file
+                pass
+    return deleted
 
 
 def _write_json(rows: List[dict], path: Path) -> None:
@@ -54,21 +73,26 @@ def job() -> Dict[str, object]:
     Orchestrator:
 
     Step-0:
-      - clear output/extracted_latest
+      - clear output/extracted_latest_jobs
       - download firebase node
       - delete expired from firebase (deadline < today IST)
       - save cleaned snapshot locally
-      - build existing_job_id_set
+      - build existing composite-key set (platform:oppurtunity_type:job_id)
 
     Step-1:
-      - platform extractors run and RETURN ONLY DELTA rows (platform-level dedupe)
+      - each platform extractor returns DELTA rows (deduped against baseline set)
 
     Step-2:
-      - save delta json/csv
-      - upload delta to firebase using push keys
+      - per-platform file output:
+          output/extract data/jobs/<platform>/
+        * purge old files in that folder first
+        * write fresh JSON + CSV
+
+    Step-3:
+      - upload ALL delta rows to firebase (push keys)
     """
 
-    OUTPUT_DIR_EXTRACT.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR_EXTRACT_BASE.mkdir(parents=True, exist_ok=True)
 
     # ---------------------------------------------------------------
     # Step-0 baseline snapshot + expiry purge
@@ -77,7 +101,7 @@ def job() -> Dict[str, object]:
         node_path=FIREBASE_NODE_PATH,
         out_dir=OUTPUT_DIR_LATEST,
     )
-    existing_job_ids = baseline.existing_job_id_set
+    existing_keys = baseline.existing_job_id_set  # Set[str] composite keys
 
     # ---------------------------------------------------------------
     # Registry pattern: platform returns (delta_rows, platform_stats)
@@ -94,7 +118,11 @@ def job() -> Dict[str, object]:
 
     per_source_stats: Dict[str, dict] = {}
     per_source_delta_counts: Dict[str, int] = {}
+    per_source_files: Dict[str, Dict[str, str]] = {}
+    per_source_deleted_old_files: Dict[str, int] = {}
+
     all_delta_rows: List[dict] = []
+    ts = _timestamp_str()
 
     for src in DEFAULT_SOURCES:
         extractor = registry.get(src)
@@ -104,7 +132,7 @@ def job() -> Dict[str, object]:
         delta_rows, stats = extractor(
             per_page=per_page,
             max_pages=max_pages,
-            existing_job_ids=existing_job_ids,
+            existing_job_ids=existing_keys,      # ✅ composite keys
             stop_when_page_all_seen=True,
         )
 
@@ -112,15 +140,26 @@ def job() -> Dict[str, object]:
         per_source_delta_counts[src] = len(delta_rows)
         all_delta_rows.extend(delta_rows)
 
-    # ---------------------------------------------------------------
-    # Step-2 Save delta output
-    # ---------------------------------------------------------------
-    ts = _timestamp_str()
-    json_path = OUTPUT_DIR_EXTRACT / f"{DEFAULT_OUT_PREFIX}_{ts}.json"
-    csv_path = OUTPUT_DIR_EXTRACT / f"{DEFAULT_OUT_PREFIX}_{ts}.csv"
+        # -----------------------------------------------------------
+        # Step-2 (per platform): purge old + write fresh files
+        # output/extract data/jobs/<platform>/
+        # -----------------------------------------------------------
+        platform_dir = OUTPUT_DIR_EXTRACT_BASE / src
+        platform_dir.mkdir(parents=True, exist_ok=True)
 
-    _write_json(all_delta_rows, json_path)
-    _write_csv(all_delta_rows, csv_path)
+        deleted_old = _delete_all_files_in_dir(platform_dir)
+        per_source_deleted_old_files[src] = deleted_old
+
+        json_path = platform_dir / f"{src}_jobs_{ts}.json"
+        csv_path = platform_dir / f"{src}_jobs_{ts}.csv"
+
+        _write_json(delta_rows, json_path)
+        _write_csv(delta_rows, csv_path)
+
+        per_source_files[src] = {
+            "json_file": str(json_path),
+            "csv_file": str(csv_path),
+        }
 
     # ---------------------------------------------------------------
     # Step-3 Upload delta only (firebase generates keys)
@@ -141,7 +180,7 @@ def job() -> Dict[str, object]:
             "expired_deleted_from_firebase": baseline.expired_deleted_from_firebase,
             "kept_count_after_prune": baseline.kept_count,
             "saved_file": baseline.saved_file,
-            "existing_job_ids_count": len(existing_job_ids),
+            "existing_job_ids_count": len(existing_keys),
         },
 
         "scrape": {
@@ -154,8 +193,9 @@ def job() -> Dict[str, object]:
         },
 
         "files": {
-            "json_file": str(json_path),
-            "csv_file": str(csv_path),
+            "base_dir": str(OUTPUT_DIR_EXTRACT_BASE),
+            "deleted_old_files_by_source": per_source_deleted_old_files,
+            "by_source": per_source_files,
         },
 
         "firebase": firebase_result,

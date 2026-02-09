@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import firebase_admin
 from firebase_admin import credentials, db
@@ -81,7 +81,7 @@ def upload_rows_push_keys(
       /<node_path>/<pushId> = row
 
     Tradeoff:
-      - Re-running will duplicate unless you add dedupe (we do dedupe BEFORE upload).
+      - Re-running will duplicate unless you dedupe BEFORE upload (we do).
     """
     _init_firebase()
     node_path = _normalize_node_path(node_path)
@@ -176,7 +176,7 @@ def download_node_snapshot(*, node_path: str) -> Any:
 
 # -------------------------------------------------------------------
 # Step-0 baseline: delete local latest files, prune expired in Firebase,
-# save cleaned snapshot, and return existing_job_id_set
+# save cleaned snapshot, and return existing composite-key set
 # -------------------------------------------------------------------
 @dataclass(frozen=True)
 class BaselineSnapshotResult:
@@ -188,7 +188,7 @@ class BaselineSnapshotResult:
     expired_deleted_from_firebase: int
     kept_count: int
     saved_file: str
-    existing_job_id_set: Set[int]
+    existing_job_id_set: Set[str]  # ✅ composite keys
 
 
 def _parse_deadline_yyyy_mm_dd(s: Any) -> Optional[date]:
@@ -208,16 +208,6 @@ def _parse_deadline_yyyy_mm_dd(s: Any) -> Optional[date]:
     try:
         y, m, d = txt.split("-")
         return date(int(y), int(m), int(d))
-    except Exception:
-        return None
-
-
-def _extract_job_id_int(job_obj: Dict[str, Any]) -> Optional[int]:
-    jid = job_obj.get("job_id")
-    if jid is None or str(jid).strip() == "":
-        return None
-    try:
-        return int(jid)
     except Exception:
         return None
 
@@ -242,23 +232,86 @@ def _delete_all_files_in_dir(dir_path: Path) -> int:
     return deleted
 
 
+def _norm_str(x: Any) -> str:
+    return str(x).strip().lower() if x is not None else ""
+
+
+def _infer_platform(obj: Dict[str, Any]) -> str:
+    """
+    Best-effort for legacy rows (backward compatibility).
+    If explicit platform exists -> use it.
+    Else infer from URLs if possible.
+    """
+    p = _norm_str(obj.get("platform"))
+    if p:
+        return p
+
+    # infer from url fields (optional but avoids dupes for old data)
+    for k in ("application_url", "short_url", "public_url"):
+        v = str(obj.get(k) or "")
+        if "unstop.com" in v:
+            return "unstop"
+
+    return ""
+
+
+def _infer_opp_type(obj: Dict[str, Any]) -> str:
+    """
+    Prefer the contract field.
+    Fallback to older keys if present.
+    """
+    ot = _norm_str(obj.get("oppurtunity_type"))
+    if ot:
+        return ot
+
+    # common legacy fields
+    for k in ("subtype", "type", "opportunity_type", "opportunity"):
+        ot2 = _norm_str(obj.get(k))
+        if ot2:
+            return ot2
+
+    return ""
+
+
+def _extract_composite_key(obj: Dict[str, Any]) -> Optional[str]:
+    """
+    Composite dedupe key:
+      platform:oppurtunity_type:job_id
+    """
+    platform = _infer_platform(obj)
+    opp_type = _infer_opp_type(obj)
+
+    if not platform or not opp_type:
+        return None
+
+    raw_jid = obj.get("job_id")
+    if raw_jid is None or str(raw_jid).strip() == "":
+        return None
+
+    try:
+        jid = int(raw_jid)
+    except Exception:
+        return None
+
+    return f"{platform}:{opp_type}:{jid}"
+
+
 def snapshot_prune_delete_and_save(
     *,
     node_path: str,
     out_dir: Path,
     deadline_field: str = "application_deadline",
-    job_id_field: str = "job_id",
 ) -> BaselineSnapshotResult:
     """
     Step-0 baseline operation:
 
-    1) Delete any existing files in output/extracted_latest/
+    1) Delete any existing files in output/extracted_latest_jobs/
     2) Download Firebase node
     3) Identify expired items where application_deadline < today (IST date)
-    4) Delete expired items FROM FIREBASE
+    4) Delete expired items FROM FIREBASE (by push key)
     5) Download node again (cleaned)
-    6) Save cleaned snapshot JSON to output/extracted_latest/<node>_latest_<ts>.json
-    7) Build existing_job_id_set from cleaned snapshot and return it (for platform-level dedupe)
+    6) Save cleaned snapshot JSON to output/extracted_latest_jobs/<node>_latest_<ts>.json
+    7) Build existing composite-key set and return it (for platform-level dedupe)
     """
     _init_firebase()
     node_path = _normalize_node_path(node_path)
@@ -278,25 +331,20 @@ def snapshot_prune_delete_and_save(
 
     # Determine expired push-keys to delete
     expired_keys: List[str] = []
-    kept_keys: List[str] = []
 
-    for k, v in raw.items():
+    for push_key, v in raw.items():
         if not isinstance(v, dict):
-            # Unexpected shape: keep but it won't contribute to job_id set
-            kept_keys.append(k)
             continue
 
         dl = _parse_deadline_yyyy_mm_dd(v.get(deadline_field))
         if dl is not None and dl < today:
-            expired_keys.append(k)
-        else:
-            kept_keys.append(k)
+            expired_keys.append(push_key)
 
     # Delete expired from firebase
     expired_deleted = 0
-    for k in expired_keys:
+    for push_key in expired_keys:
         try:
-            ref.child(k).delete()
+            ref.child(push_key).delete()
             expired_deleted += 1
         except Exception:
             # best-effort delete
@@ -313,13 +361,13 @@ def snapshot_prune_delete_and_save(
     file_path = out_dir / f"{safe_node}_latest_{ts}.json"
     file_path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Build existing job_id set for platform dedupe
-    existing_ids: Set[int] = set()
+    # Build existing composite-key set for platform dedupe
+    existing_keys: Set[str] = set()
     for _, obj in cleaned.items():
         if isinstance(obj, dict):
-            jid = _extract_job_id_int(obj)
-            if jid is not None:
-                existing_ids.add(jid)
+            k = _extract_composite_key(obj)
+            if k:
+                existing_keys.add(k)
 
     return BaselineSnapshotResult(
         ok=True,
@@ -330,7 +378,7 @@ def snapshot_prune_delete_and_save(
         expired_deleted_from_firebase=expired_deleted,
         kept_count=len(cleaned) if isinstance(cleaned, dict) else 0,
         saved_file=str(file_path),
-        existing_job_id_set=existing_ids,
+        existing_job_id_set=existing_keys,
     )
 
 
