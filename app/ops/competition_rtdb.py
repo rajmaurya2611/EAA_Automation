@@ -1,4 +1,4 @@
-# app/ops/job_rtdb.py
+# app/ops/competition_rtdb.py
 from __future__ import annotations
 
 import json
@@ -27,16 +27,7 @@ def _normalize_node_path(node_path: str) -> str:
     return node_path
 
 
-def _norm_str(x: Any) -> str:
-    return str(x).strip().lower() if x is not None else ""
-
-
 def _parse_deadline_yyyy_mm_dd(s: Any) -> Optional[date]:
-    """
-    Accepts:
-      - 'YYYY-MM-DD'
-      - 'YYYY-MM-DDTHH:MM:SS+05:30' (we take first 10)
-    """
     if s is None:
         return None
     txt = str(s).strip()
@@ -51,51 +42,32 @@ def _parse_deadline_yyyy_mm_dd(s: Any) -> Optional[date]:
         return None
 
 
-def _infer_platform(obj: Dict[str, Any]) -> str:
-    p = _norm_str(obj.get("platform"))
-    if p:
-        return p
-
-    for k in ("application_url", "short_url", "public_url"):
-        v = str(obj.get(k) or "")
-        if "unstop.com" in v:
-            return "unstop"
-    return ""
-
-
-def _infer_opp_type(obj: Dict[str, Any]) -> str:
-    ot = _norm_str(obj.get("oppurtunity_type"))
-    if ot:
-        return ot
-
-    for k in ("subtype", "type", "opportunity_type", "opportunity"):
-        ot2 = _norm_str(obj.get(k))
-        if ot2:
-            return ot2
-    return ""
-
-
-def _extract_job_composite_key(obj: Dict[str, Any]) -> Optional[str]:
-    """
-    Composite key:
-      platform:oppurtunity_type:job_id
-    """
-    platform = _infer_platform(obj)
-    opp_type = _infer_opp_type(obj)
-
-    if not platform or not opp_type:
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
         return None
-
-    raw_jid = obj.get("job_id")
-    if raw_jid is None or str(raw_jid).strip() == "":
-        return None
-
     try:
-        jid = int(raw_jid)
+        return int(value)
     except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return None
+
+
+def _make_comp_key(platform: Any, comp_type: Any, comp_id: Any) -> Optional[str]:
+    cid = _coerce_int(comp_id)
+    if cid is None:
         return None
 
-    return f"{platform}:{opp_type}:{jid}"
+    p = (str(platform).strip().lower() if platform is not None else "").strip()
+    t = (str(comp_type).strip().lower() if comp_type is not None else "").strip()
+
+    if not p:
+        p = "unknown_platform"
+    if not t:
+        t = "unknown_type"
+
+    return f"{p}:{t}:{cid}"
 
 
 def _delete_all_files_in_dir(dir_path: Path) -> int:
@@ -112,9 +84,6 @@ def _delete_all_files_in_dir(dir_path: Path) -> int:
     return deleted
 
 
-# -------------------------------------------------------------------
-# Upload: push keys (Firebase generates IDs)
-# -------------------------------------------------------------------
 def upload_rows_push_keys(
     *,
     node_path: str,
@@ -144,18 +113,12 @@ def upload_rows_push_keys(
     }
 
 
-# -------------------------------------------------------------------
-# Download node snapshot
-# -------------------------------------------------------------------
 def download_node_snapshot(*, node_path: str) -> Any:
     _init_firebase()
     node_path = _normalize_node_path(node_path)
     return db.reference(node_path).get()
 
 
-# -------------------------------------------------------------------
-# Step-0 baseline snapshot result
-# -------------------------------------------------------------------
 @dataclass(frozen=True)
 class BaselineSnapshotResult:
     ok: bool
@@ -166,7 +129,7 @@ class BaselineSnapshotResult:
     expired_deleted_from_firebase: int
     kept_count: int
     saved_file: str
-    existing_job_key_set: Set[str]  # composite keys
+    existing_comp_key_set: Set[str]
 
 
 def snapshot_prune_delete_and_save(
@@ -175,14 +138,6 @@ def snapshot_prune_delete_and_save(
     out_dir: Path,
     deadline_field: str = "application_deadline",
 ) -> BaselineSnapshotResult:
-    """
-    1) Delete existing files in out_dir
-    2) Download node
-    3) Delete expired where deadline < today (IST)
-    4) Re-fetch cleaned
-    5) Save cleaned snapshot JSON
-    6) Build existing composite-key set
-    """
     _init_firebase()
     node_path = _normalize_node_path(node_path)
 
@@ -198,16 +153,16 @@ def snapshot_prune_delete_and_save(
     if not isinstance(raw, dict):
         raw = {}
 
-    expired_push_keys: List[str] = []
+    expired_keys: List[str] = []
     for push_key, v in raw.items():
         if not isinstance(v, dict):
             continue
         dl = _parse_deadline_yyyy_mm_dd(v.get(deadline_field))
         if dl is not None and dl < today:
-            expired_push_keys.append(push_key)
+            expired_keys.append(push_key)
 
     expired_deleted = 0
-    for push_key in expired_push_keys:
+    for push_key in expired_keys:
         try:
             ref.child(push_key).delete()
             expired_deleted += 1
@@ -225,21 +180,22 @@ def snapshot_prune_delete_and_save(
 
     existing_keys: Set[str] = set()
     for _, obj in cleaned.items():
-        if isinstance(obj, dict):
-            k = _extract_job_composite_key(obj)
-            if k:
-                existing_keys.add(k)
+        if not isinstance(obj, dict):
+            continue
+        k = _make_comp_key(obj.get("platform"), obj.get("competition_type"), obj.get("competition_id"))
+        if k:
+            existing_keys.add(k)
 
     return BaselineSnapshotResult(
         ok=True,
         node_path=f"/{node_path}",
         today_ist=today_str,
         deleted_local_files=deleted_local,
-        expired_keys_count=len(expired_push_keys),
+        expired_keys_count=len(expired_keys),
         expired_deleted_from_firebase=expired_deleted,
         kept_count=len(cleaned) if isinstance(cleaned, dict) else 0,
         saved_file=str(file_path),
-        existing_job_key_set=existing_keys,
+        existing_comp_key_set=existing_keys,
     )
 
 

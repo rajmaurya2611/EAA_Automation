@@ -1,4 +1,4 @@
-# app/services/jobs_service.py
+# app/services/competitions_service.py
 from __future__ import annotations
 
 import csv
@@ -8,18 +8,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-from app.job_platforms.unstop import OUTPUT_COLUMNS, unstop as unstop_platform
-from app.ops.job_rtdb import snapshot_prune_delete_and_save, upload_rows_push_keys
+from app.competition_platforms.unstop import OUTPUT_COLUMNS, unstop_competitions
+from app.ops.competition_rtdb import snapshot_prune_delete_and_save, upload_rows_push_keys
 
-OUTPUT_DIR_EXTRACT = Path("output") / "extract data" / "jobs"
-OUTPUT_DIR_LATEST = Path("output") / "extracted_latest" / "jobs"
+OUTPUT_DIR_EXTRACT = Path("output") / "extract data" / "competitions"
+OUTPUT_DIR_LATEST = Path("output") / "extracted_latest" / "competitions"
 
 DEFAULT_SOURCES = ["unstop"]
 DEFAULT_PER_PAGE = 18
 DEFAULT_MAX_PAGES = 1
 
-DEFAULT_OUT_PREFIX = "unstop_jobs"
-FIREBASE_NODE_PATH = os.getenv("FIREBASE_JOBS_NODE_PATH", "ai/jobs")
+DEFAULT_OUT_PREFIX = "unstop_competitions"
+FIREBASE_NODE_PATH = os.getenv("FIREBASE_COMPETITIONS_NODE_PATH", "ai/competitions")
 
 
 def _timestamp_str() -> str:
@@ -52,17 +52,17 @@ def _write_csv(rows: List[dict], path: Path) -> None:
             w.writerow({k: r.get(k, "") for k in OUTPUT_COLUMNS})
 
 
-def job() -> Dict[str, object]:
+def competitions() -> Dict[str, object]:
     OUTPUT_DIR_EXTRACT.mkdir(parents=True, exist_ok=True)
 
     baseline = snapshot_prune_delete_and_save(
         node_path=FIREBASE_NODE_PATH,
         out_dir=OUTPUT_DIR_LATEST,
     )
-    existing_job_keys = baseline.existing_job_key_set
+    existing_comp_keys = baseline.existing_comp_key_set
 
     registry = {
-        "unstop": unstop_platform,
+        "unstop": unstop_competitions,
     }
 
     per_page = DEFAULT_PER_PAGE
@@ -80,7 +80,7 @@ def job() -> Dict[str, object]:
         delta_rows, stats = extractor(
             per_page=per_page,
             max_pages=max_pages,
-            existing_job_keys=existing_job_keys,
+            existing_comp_keys=existing_comp_keys,
             stop_when_page_all_seen=True,
         )
 
@@ -88,7 +88,6 @@ def job() -> Dict[str, object]:
         per_source_delta_counts[src] = len(delta_rows)
         all_delta_rows.extend(delta_rows)
 
-        # dump per-platform under output/extract data/jobs/<platform>/
         platform_dir = OUTPUT_DIR_EXTRACT / src
         platform_dir.mkdir(parents=True, exist_ok=True)
         _clear_dir_files(platform_dir)
@@ -115,7 +114,7 @@ def job() -> Dict[str, object]:
             "expired_deleted_from_firebase": baseline.expired_deleted_from_firebase,
             "kept_count_after_prune": baseline.kept_count,
             "saved_file": baseline.saved_file,
-            "existing_job_keys_count": len(existing_job_keys),
+            "existing_comp_keys_count": len(existing_comp_keys),
         },
         "scrape": {
             "sources": DEFAULT_SOURCES,

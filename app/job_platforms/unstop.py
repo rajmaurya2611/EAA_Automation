@@ -13,9 +13,6 @@ from urllib3.util.retry import Retry
 
 BASE_URL = "https://unstop.com/api/public/opportunity/search-result"
 
-# -----------------------------
-# HTML parsing helpers (stdlib-only)
-# -----------------------------
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
 
@@ -27,9 +24,6 @@ def _strip_tags(html: str) -> str:
     return txt
 
 
-# -----------------------------
-# Formatting helpers
-# -----------------------------
 def _safe_join(xs: Iterable[str], sep: str = ", ") -> str:
     xs2 = [str(x).strip() for x in xs if str(x).strip()]
     return sep.join(xs2)
@@ -94,15 +88,12 @@ def format_ist_date(value: Any) -> str:
     if len(s) >= 10 and s[4] == "-" and s[7] == "-":
         return s[:10]
     try:
-        dt = datetime.fromisoformat(s)  # supports +05:30
+        dt = datetime.fromisoformat(s)
         return dt.date().isoformat()
     except Exception:
         return s[:10] if len(s) >= 10 else ""
 
 
-# -----------------------------
-# HTTP client with retry
-# -----------------------------
 def make_session(timeout_s: int = 25) -> Tuple[requests.Session, int]:
     session = requests.Session()
     retry = Retry(
@@ -120,14 +111,11 @@ def make_session(timeout_s: int = 25) -> Tuple[requests.Session, int]:
     return session, timeout_s
 
 
-# -----------------------------
-# Scraper core
-# -----------------------------
 @dataclass
 class ScrapeConfig:
     per_page: int = 18
-    max_pages: int = 0  # 0 = auto until empty
-    extra_params: Optional[Dict[str, Any]] = None  # keep None for "no filters"
+    max_pages: int = 0
+    extra_params: Optional[Dict[str, Any]] = None
 
 
 def fetch_page(
@@ -137,11 +125,7 @@ def fetch_page(
     per_page: int,
     extra_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    params = {
-        "opportunity": "jobs",
-        "page": page,
-        "per_page": per_page,
-    }
+    params = {"opportunity": "jobs", "page": page, "per_page": per_page}
     if extra_params:
         for k, v in extra_params.items():
             if v is None:
@@ -157,7 +141,6 @@ def fetch_page(
     }
 
     r = session.get(BASE_URL, params=params, headers=headers, timeout=timeout_s)
-
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
 
@@ -172,15 +155,10 @@ def extract_row(item: Dict[str, Any]) -> Dict[str, Any]:
     job_detail = item.get("jobDetail") or item.get("job_detail") or {}
 
     loc_dicts = item.get("locations") or []
-    loc_cities, loc_states, loc_countries = [], [], []
+    loc_cities = []
     for ld in loc_dicts:
-        if isinstance(ld, dict):
-            if ld.get("city"):
-                loc_cities.append(ld["city"])
-            if ld.get("state"):
-                loc_states.append(ld["state"])
-            if ld.get("country"):
-                loc_countries.append(ld["country"])
+        if isinstance(ld, dict) and ld.get("city"):
+            loc_cities.append(ld["city"])
 
     required_skills = item.get("required_skills") or item.get("skills") or []
     skill_names = []
@@ -210,8 +188,6 @@ def extract_row(item: Dict[str, Any]) -> Dict[str, Any]:
         "end_date": item.get("end_date"),
         "region": item.get("region"),
         "location_cities": _safe_join(loc_cities),
-        "location_states": _safe_join(loc_states),
-        "location_countries": _safe_join(loc_countries),
         "work_mode": work_mode,
         "timing": job_detail.get("timing"),
         "paid_unpaid": job_detail.get("paid_unpaid"),
@@ -230,15 +206,12 @@ def extract_row(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# -----------------------------
-# Output mapping / contract
-# -----------------------------
 COLUMN_MAP = {
     "id": "job_id",
     "title": "job_title",
     "company": "company_name",
     "company_id": "company_id",
-    "subtype": "oppurtunity_type",  # requested spelling
+    "subtype": "oppurtunity_type",
     "work_mode": "work_mode",
     "salary": "salary_range",
     "timing": "timing",
@@ -297,7 +270,6 @@ def remap_row(row: Dict[str, Any]) -> Dict[str, Any]:
         if src_key in row:
             out[dst_key] = row.get(src_key)
 
-    # constants / defaults
     out["platform"] = "unstop"
     out["status"] = 1
     out["order"] = 0
@@ -323,40 +295,27 @@ def _coerce_job_id(row: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-def _build_composite_key(row: Dict[str, Any]) -> Optional[str]:
-    """
-    platform:oppurtunity_type:job_id
-    """
-    platform = str(row.get("platform") or "").strip().lower()
-    opp_type = str(row.get("oppurtunity_type") or "").strip().lower()
+def _norm_opp_type(row: Dict[str, Any]) -> str:
+    return str(row.get("oppurtunity_type") or "").strip().lower()
 
-    if not platform or not opp_type:
-        return None
 
-    jid = _coerce_job_id(row)
-    if jid is None:
-        return None
-
-    return f"{platform}:{opp_type}:{jid}"
+def _make_job_key(platform: str, opp_type: str, job_id: int) -> str:
+    p = (platform or "").strip().lower()
+    t = (opp_type or "").strip().lower()
+    if not p:
+        p = "unknown_platform"
+    if not t:
+        t = "unknown_type"
+    return f"{p}:{t}:{job_id}"
 
 
 def scrape_jobs(
     cfg: ScrapeConfig,
     *,
-    existing_job_ids: Optional[Set[str]] = None,
+    existing_job_keys: Optional[Set[str]] = None,
     stop_when_page_all_seen: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """
-    Returns:
-      (delta_rows, stats)
-
-    Dedupe happens HERE using composite key:
-      platform + oppurtunity_type + job_id
-
-    stop_when_page_all_seen:
-      - If True, and a page returns 100% already-seen composite keys, we early-stop.
-    """
-    existing_keys = existing_job_ids or set()
+    existing_job_keys = existing_job_keys or set()
 
     session, timeout_s = make_session()
     delta_rows: List[Dict[str, Any]] = []
@@ -368,7 +327,6 @@ def scrape_jobs(
         "kept_delta": 0,
         "skipped_existing": 0,
         "skipped_missing_job_id": 0,
-        "skipped_missing_composite": 0,
         "early_stop_all_seen_page": 0,
     }
 
@@ -389,29 +347,24 @@ def scrape_jobs(
         for item in items:
             if not isinstance(item, dict):
                 continue
+
             extracted = extract_row(item)
             mapped = remap_row(extracted)
             stats["items_seen"] += 1
 
-            # Validate job_id
             jid = _coerce_job_id(mapped)
             if jid is None:
                 stats["skipped_missing_job_id"] += 1
                 page_all_seen = False
                 continue
 
-            # Composite key
-            key = _build_composite_key(mapped)
-            if key is None:
-                stats["skipped_missing_composite"] += 1
-                page_all_seen = False
-                continue
+            opp_type = _norm_opp_type(mapped)
+            key = _make_job_key("unstop", opp_type, jid)
 
-            if key in existing_keys:
+            if key in existing_job_keys:
                 stats["skipped_existing"] += 1
                 continue
 
-            # new row
             page_all_seen = False
             delta_rows.append(mapped)
             stats["kept_delta"] += 1
@@ -429,15 +382,11 @@ def unstop(
     per_page: int = 18,
     max_pages: int = 0,
     *,
-    existing_job_ids: Optional[Set[str]] = None,
+    existing_job_keys: Optional[Set[str]] = None,
     stop_when_page_all_seen: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     cfg = ScrapeConfig(per_page=int(per_page), max_pages=int(max_pages), extra_params=None)
-    return scrape_jobs(
-        cfg,
-        existing_job_ids=existing_job_ids,
-        stop_when_page_all_seen=stop_when_page_all_seen,
-    )
+    return scrape_jobs(cfg, existing_job_keys=existing_job_keys, stop_when_page_all_seen=stop_when_page_all_seen)
 
 
 __all__ = ["unstop", "OUTPUT_COLUMNS"]
