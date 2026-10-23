@@ -2,3 +2,5 @@ secrets
 .env
 scraper
 output
+downloads
+
